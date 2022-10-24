@@ -2,4 +2,4 @@
 
 # trial 1 
 
-[![Watch the video](https://i.imgur.com/vKb2F1B.png)]()
+[![Watch the video](https://github.com/syncsyncsync/sp-detection/blob/main/output.mp4)]()
