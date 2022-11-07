@@ -3,26 +3,27 @@
 """
 Author: syncsyncsync
 Date: 2022/11/05
+Date: 2022/11/06 KF
+
 Description: Tracking object 
 """     
 
-
-
 import os
 import cv2
-import torch
+#import torch
 import logging
 from operator import index
 from dataclasses import dataclass
 
 import numpy as np 
 import pandas as pd 
+from scipy.stats.distributions import chi2
 
 from abc import ABC, abstractmethod
 
 #from distutils.command.build_ext import build_ext
 
-from sperm_data.scripts.pre_process import label_path
+#from sperm_data.scripts.pre_process import label_path
 
 
 ALMOST_ZERO_VALUE = 1e-10
@@ -45,7 +46,6 @@ def import_label_list(path):
             
             
     return label_list
-
 
 '''
 class Iterator(ABC):
@@ -309,10 +309,13 @@ class VideoIterator(Frame,FrameBasicInfo):
             tl_x, tl_y, br_x, br_y = convert_cxcywh_to_xywh(self.frame.label[i,1],self.frame.label[i,2],self.frame.label[i,3], self.frame.label[i,4], self.size_frame_w, self.size_frame_h)
         # add rectangle to frame 
       
+
+        print("to be fixed L313")
+        '''
         if self.frame.label[i,0] == 0:
             cv2.rectangle(frame_binary, (tl_x, tl_y), (br_x, br_y), (255,255,255), -1)
             # measurement velocity using optical flow
-            v_x, v_y = calc_vel(frame_binary, self.old_frame, tl_x, tl_y, br_x, br_y, class_num=0)
+            v_x, v_y = self.calc_vel(self.frame_binary, self.old_frame, tl_x, tl_y, br_x, br_y, class_num=0)
             pt2_x = int((tl_x + br_x)/2 + 20*v_x)
             pt2_y = int((tl_y + br_y)/2 + 20*v_y)
 
@@ -328,8 +331,277 @@ class VideoIterator(Frame,FrameBasicInfo):
 
             out_img = cv2.arrowedLine(out_img, ( (tl_x+br_x)//2, (tl_y+br_y)//2), (pt2_x , pt2_y),  (0,255,0), 3)
             out_img = cv2.arrowedLine(out_img, ( (tl_x+br_x)//2, (tl_y+br_y)//2), (pt2_x , pt2_y),  (0,255,0), 3)
-        
+        '''    
         return out_img
+            
+
+    def calc_vel(self, frame, previous_frame, label_index, class_num=0):
+        # 1. crop from frame_diff by tl_x, tl_y, br_x, br_y 
+        #=self.frame.label.iloc[label_index,0]
+
+        frame_crop = self.frame.img[tl_y:br_y, tl_x:br_x]
+        previous_crop = self.old_frame[tl_y:br_y, tl_x:br_x]
+        # 2. calculate optical flow
+        # 2.1 convert to gray scale
+
+        # check channel if not gray scale, convert to gray scale
+        if len(frame_crop.shape) == 3:
+            frame_crop_gray = cv2.cvtColor(frame_crop, cv2.COLOR_BGR2GRAY)
+        else:
+            frame_crop_gray = frame_crop
+
+        # check channel if not gray scale, convert to gray scale
+        if len(previous_crop.shape) == 3:
+            previous_crop_gray = cv2.cvtColor(previous_crop, cv2.COLOR_BGR2GRAY)
+        else:
+            previous_crop_gray = previous_crop
+        # 2.2 calculate optical flow
+        flow = cv2.calcOpticalFlowFarneback(previous_crop_gray,frame_crop_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+
+        # 2.3 calculate velocity
+        vel = np.sqrt(flow[...,0]**2 + flow[...,1]**2)
+        vel = np.mean(vel)
+        print(vel, 'pix/s', 'vel_x:',flow[...,0].mean(), 'vel_y:',flow[...,1].mean())
+
+        return [flow[...,0].mean(),flow[...,1].mean()]
+
+
+
+
+
+class MyKalmanFilter(object):
+    # kalman filter using opencv 
+    # Usage: 
+    #   kf = MyKalmanFilter()
+    #   kf.correct(msr)
+    #   kf.predict()
+    # Ref:
+    # https://docs.opencv.org/3.4/dd/d6a/classcv_1_1KalmanFilter.html#aa710d2255566bec8d6ce608d103d4fa7
+    #
+    # for (x,y) model_dim=8, measure_dim=4
+    # state vector :(x, y, h, w, vx, vy, vh, vw)
+    #
+    # for (x,y,z) model_dim=10, measure_dim=5
+    # state vector :(x, y, z, h, w, vx, vy, vz, vh, vw)
+
+    XYZ_MODE=10
+    XYZ_MODE_MSR = 5
+    
+    XY_MODE=8
+    XY_MODE_MSR = 4
+
+    def __init__(self, model_dim=XY_MODE, measure_dim=XY_MODE_MSR, fps=1, measure_noise_amplitude=1e-3, process_noise_amplitude=1e-3):
+        self.model_dim = model_dim
+        self.measure_dim = measure_dim
+        self.fps = fps
+        self.measure_noise_amplitude = measure_noise_amplitude
+        self.process_noise_amplitude = process_noise_amplitude
+        
+        # initialzation of model
+        self.kalman_filter = self.init_kalman_filter()
+        self.model_info()
+
+    def init_kalman_filter(self):
+        kalman_filter = cv2.KalmanFilter(self.model_dim, self.measure_dim)
+
+        # measurement matrix
+        kalman_filter.measurementMatrix = cv2.setIdentity( np.eye(self.measure_dim, self.model_dim, dtype=np.float32))
+
+        # transition matrix 
+        kalman_filter.transitionMatrix = np.eye(self.model_dim, dtype=np.float32)
+        for i in range( self.model_dim - self.measure_dim):
+            kalman_filter.transitionMatrix[i, i + self.measure_dim ] = 1./self.fps
+
+        # measurement noise covariance
+        kalman_filter.measurementNoiseCov = cv2.setIdentity(kalman_filter.measurementNoiseCov, self.measure_noise_amplitude )
+
+        # process noise covariance
+        kalman_filter.processNoiseCov = cv2.setIdentity(np.eye(self.model_dim, dtype=np.float32) , self.process_noise_amplitude)
+
+        # error covariance
+        kalman_filter.errorCovPost = cv2.setIdentity(kalman_filter.errorCovPost, 1)
+
+        return kalman_filter
+
+    def model_info(self):
+
+        print("***** measurementMatrix *****")
+        print("type: ",self.kalman_filter.measurementMatrix.dtype)
+        print("shape: ",self.kalman_filter.measurementMatrix.shape)
+        print("matrix:")
+        print(self.kalman_filter.measurementMatrix)
+
+        print("***** transitionMatrix *****")
+        print("type: ",self.kalman_filter.transitionMatrix.dtype)
+        print("shape: ",self.kalman_filter.transitionMatrix.shape)
+        print("matrix:")
+        print(self.kalman_filter.transitionMatrix)
+
+        print("***** measurementNoiseCov *****")
+        print("type: ",self.kalman_filter.measurementNoiseCov.dtype)
+        print("shape: ",self.kalman_filter.measurementNoiseCov.shape)
+        print("matrix:")
+        #print(kalman_filter.measurementNoiseCov)
+
+        print("***** processNoiseCov *****")
+        print("type: ", self.kalman_filter.processNoiseCov.dtype)
+        print("shape: ", self.kalman_filter.processNoiseCov.shape)
+        print("matrix:")
+        #print(kalman_filter.processNoiseCov)
+
+        print("***** errorCovPost *****")
+        print("type: ", self.kalman_filter.errorCovPost.dtype)
+        print("shape: ", self.kalman_filter.errorCovPost.shape)
+        print("matrix:")
+        #print(kalman_filter.errorCovPost)
+
+    def update_state(self, measure):
+        measure = np.array(measure, dtype=np.float32)
+        if self.gating(measure):
+            return self.kalman_filter.correct(measure)
+        else:
+            return self.kalman_filter.statePost
+
+    def update_and_predict(self, measure, gating='default'):
+        #convert measure as np.float32
+        measure = np.array(measure, dtype=np.float32)
+
+        #gating
+        #if gating == 'Gaussian':
+        #    self.Chebyshev_gate(self, measure, self.kalman_filter.statePost[:self.measure_dim] , self.kalman_filter.errorCovPost , threshold=0.95)
+
+        #update by measurement
+        self.kalman_filter.correct(measure)
+        #return predict
+        return self.kalman_filter.predict()
+
+    def predict(self):
+        return self.kalman_filter.predict()
+        
+    def get_aprior_state(self):
+        return self.kalman_filter.statePre, self.kalman_filter.errorCovPre
+
+    def get_aposteriori_state(self):
+        #corrected state
+        return self.kalman_filter.statePost, self.kalman_filter.errorCovPost
+
+    def get_apriori_error(self):
+        #predicted state
+        return self.kalman_filter.errorCovPre
+
+    def get_posteriori_error (self):
+        return self.kalman_filter.errorCovPost
+    
+    def _debug(self):
+        print("***** statePost *****")
+        print("type: ",self.kalman_filter.statePost.dtype)
+        print("shape: ",self.kalman_filter.statePost.shape)
+        print("matrix:")
+        print(self.kalman_filter.statePost)
+
+        print("***** errorCovPost *****")
+        print("type: ",self.kalman_filter.errorCovPost.dtype)
+        print("shape: ",self.kalman_filter.errorCovPost.shape)
+        print("matrix:")
+        print(self.kalman_filter.errorCovPost)
+
+        print("***** gain *****")
+        print("type: ",self.kalman_filter.gain.dtype)
+        print("shape: ",self.kalman_filter.gain.shape)
+        print("matrix:")
+        print(self.kalman_filter.gain)
+
+    def maharavi_distance(self, measurement, mean, cov):
+        # inverse of covariance matrix
+        cov_inv = np.linalg.inv(cov)
+        # difference between measurement and mean
+        _diff = measurement - mean
+        # mahalanobis distance
+        md = np.sqrt( np.dot( np.dot( _diff, cov_inv ), _diff.T ) )
+        return md
+    
+    # remove outlier measurement using Chi-square distribution and Mahalanobis distance
+    # https://en.wikipedia.org/wiki/Chi-squared_distribution
+    # https://en.wikipedia.org/wiki/Mahalanobis_distance
+    # 
+    # measurement: measurement vector
+    # mean: mean vector
+    # cov: covariance matrix
+    # threshold: probability threshold for Chi-square distribution
+    #
+    def chi2_gating(self, measurement, mean, cov, threshold=0.95):
+        # mahalanobis distance
+        md = self.maharavi_distance(measurement, mean, cov)
+    
+        # chi square gaiting threshold
+        chi2_threshold = chi2.ppf(threshold, df=self.measure_dim)
+
+        # gaiting
+        if md < chi2_threshold:
+            return True
+        else:
+            return False
+
+    # Chebyshev's inequality gating
+    # https://en.wikipedia.org/wiki/Chebyshev%27s_inequality
+    #
+    # measurement: measurement vector
+    # mean: mean vector
+    # cov: covariance matrix
+    # threshold: probability threshold for Chebyshev's inequality
+    def Chebyshev_gate(self, measurement, mean, cov , threshold=0.95):
+        # if measurement and _mean is not same dimension, return False
+        if len(measurement) != len(mean):
+            logging.error("measurement and _mean is not same dimension")
+            return False
+
+        # calc Chebyshev's inequality 
+        if threshold <= 0 :
+            k = 0
+        elif threshold >=1:
+            k = 100 #set as infty
+        else:
+            prob = 1 - threshold
+            k = np.sqrt(1/prob)
+
+        std_vars = np.sqrt(np.ndarray.diagonal(cov))
+        _gate_label = k * std_vars 
+        
+        data = abs(measurement - mean)
+        # check if values of data's elements are less than _gate_label's elements
+        if np.all(data < _gate_label):
+            return True
+        else:
+            return False
+
+    def test_2d(self):
+        _msr = np.array([0.5, 0.01, 0.1, 0.1], dtype=np.float32).reshape(4,1)
+        
+        for i in range(0,100):
+            #update
+            self.kalman_filter.correct(_msr)
+
+            print(self.Chebyshev_gate(_msr, self.kalman_filter.statePost[:self.measure_dim] , self.kalman_filter.errorCovPost , threshold=0.95))
+
+            _pred = self.kalman_filter.predict()
+            _pred += np.random.randn(self.model_dim).reshape(-1,1) * 0.1
+            _msr=np.array(_pred[:self.measure_dim], dtype=np.float32).reshape(-1,1)
+    
+    def test_3d(self):
+        _msr = np.array([0.5, 0.01, 0, 0.1, 0.1], dtype=np.float32).reshape(-1,1)
+
+        for i in range(0,100):
+            #update
+            self.kalman_filter.correct(_msr)
+
+            print(self.Chebyshev_gate(_msr, self.kalman_filter.statePost[:self.measure_dim] , self.kalman_filter.errorCovPost , threshold=0.95))
+            
+            _pred = self.kalman_filter.predict()
+            _pred += np.random.randn(self.model_dim).reshape(-1,1) * 0.1
+            _msr=np.array(_pred[:self.measure_dim], dtype=np.float32).reshape(-1,1)
+            #print(_msr.shape)
+
+
     
     
 def read_mp4_v2(video_path,label_path=None,debug=True):
@@ -404,6 +676,7 @@ def load_mp4(path, debug=False):
     return frames
 
 
+'''
 
 #convert (cx,cy,w,h) to (top left x, top left y, bottom right x, bottom right y)
 def convert_cxcywh_to_xywh(cx,cy,w,h,size_frame_w,size_frame_h):
@@ -413,9 +686,9 @@ def convert_cxcywh_to_xywh(cx,cy,w,h,size_frame_w,size_frame_h):
     br_y = int((cy + w/2)*size_frame_h)
     
     return tl_x,tl_y,br_x,br_y
+
+
 '''
-
-
 def calc_vel(frame, previous_frame, tl_x, tl_y, br_x, br_y, class_num=0):
     # 1. crop from frame_diff by tl_x, tl_y, br_x, br_y 
     frame_crop = frame.img[tl_y:br_y, tl_x:br_x]
@@ -444,7 +717,7 @@ def calc_vel(frame, previous_frame, tl_x, tl_y, br_x, br_y, class_num=0):
 
     return [flow[...,0].mean(),flow[...,1].mean()]
 
-
+'''
 
 
 
